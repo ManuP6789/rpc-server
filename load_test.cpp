@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
+#include <memory>  
 
 struct LatencyStats {
     std::vector<double> latencies;
@@ -61,8 +63,8 @@ private:
 public:
     LoadGenerator(const std::string& h, uint16_t p) : host(h), port(p) {}
     
-    LatencyStats run_load_test(double requests_per_sec, int duration_sec, 
-                               int num_workers);
+    void run_load_test(double requests_per_sec, int duration_sec, 
+                               int num_workers, LatencyStats& stats);
     void run_benchmark_suite(const std::string& output_file);
 };
 
@@ -163,6 +165,7 @@ void LoadGenerator::worker_thread(int worker_id, double target_rate,
                                   int duration_sec, LatencyStats& stats,
                                   std::atomic<bool>& running) {
     try {
+        // std::cout << "Inside running the worker_thread" << worker_id << "\n";
         RPCClient client(host.c_str(), port);
         
         double inter_request_time_ms = 1000.0 / target_rate;
@@ -173,7 +176,6 @@ void LoadGenerator::worker_thread(int worker_id, double target_rate,
         
         while (running.load()) {
             auto now = std::chrono::high_resolution_clock::now();
-            
             if (now >= next_send_time) {
                 // Choose operation randomly
                 int op = op_dist(gen);
@@ -206,9 +208,8 @@ void LoadGenerator::worker_thread(int worker_id, double target_rate,
     }
 }
 
-LatencyStats LoadGenerator::run_load_test(double requests_per_sec, 
-                                          int duration_sec, int num_workers) {
-    LatencyStats stats;
+void LoadGenerator::run_load_test(double requests_per_sec, int duration_sec, 
+                                          int num_workers, LatencyStats& stats) {
     std::atomic<bool> running{true};
     std::vector<std::thread> workers;
     
@@ -223,6 +224,7 @@ LatencyStats LoadGenerator::run_load_test(double requests_per_sec,
                            i, rate_per_worker, duration_sec, 
                            std::ref(stats), std::ref(running));
     }
+    std::cout << "made it past init worker threads\n";
     
     // Run for specified duration
     std::this_thread::sleep_for(std::chrono::seconds(duration_sec));
@@ -232,23 +234,20 @@ LatencyStats LoadGenerator::run_load_test(double requests_per_sec,
     for (auto& worker : workers) {
         worker.join();
     }
-    
-    return stats;
 }
 
 void LoadGenerator::run_benchmark_suite(const std::string& output_file) {
-    std::vector<double> load_levels = {10, 50, 100, 200, 500, 1000, 2000, 5000};
-    int duration_sec = 30;
-    int num_workers = 8;
+    std::vector<double> load_levels = {3000};
+    int duration_sec = 10;
+    int num_workers = 1;
     
     std::ofstream csv(output_file);
     csv << "RequestsPerSec,AvgLatency,P50,P95,P99,P999,SuccessCount,ErrorCount,Throughput\n";
     
     for (double load : load_levels) {
         std::cout << "\n=== Testing load: " << load << " req/s ===\n";
-        
-        auto stats = run_load_test(load, duration_sec, num_workers);
-        
+        LatencyStats stats;
+        run_load_test(load, duration_sec, num_workers, stats);        
         double avg = stats.get_average();
         double p50 = stats.get_percentile(0.50);
         double p95 = stats.get_percentile(0.95);

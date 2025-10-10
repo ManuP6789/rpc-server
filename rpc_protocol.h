@@ -3,6 +3,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <arpa/inet.h> 
 
 // Protocol constants
 constexpr uint32_t RPC_MAGIC = 0x52504301; // "RPC\x01"
