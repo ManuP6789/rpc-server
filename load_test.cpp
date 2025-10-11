@@ -238,7 +238,7 @@ void LoadGenerator::run_load_test(double requests_per_sec, int duration_sec,
 
 void LoadGenerator::run_benchmark_suite(const std::string& output_file) {
     std::vector<double> load_levels = {3000};
-    int duration_sec = 10;
+    int duration_sec = 30;
     int num_workers = 1;
     
     std::ofstream csv(output_file);

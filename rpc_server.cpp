@@ -177,6 +177,13 @@ void RPCServer::handle_hash_compute(Connection* conn,
     
     conn->bytes_to_write = conn->write_buffer.size();
     conn->bytes_written = 0;
+    fprintf(stderr, "Server sending hash: '%s'\n", hex_hash);
+    fprintf(stderr, "Response payload size: %zu\n", resp_payload.size());
+    fprintf(stderr, "Response payload bytes: ");
+    for (size_t i = 0; i < std::min(resp_payload.size(), size_t(65)); i++) {
+        fprintf(stderr, "%02x ", resp_payload[i]);
+    }
+    fprintf(stderr, "\n");
     add_write(&ring, conn);
 }
 
