@@ -201,9 +201,6 @@ void RPCClient::submit_recv_payload(RequestContext* ctx) {
     size_t remaining = ctx->recv_payload_buf.size() - ctx->recv_offset;
     void* buf_ptr = ctx->recv_payload_buf.data() + ctx->recv_offset;
     
-    // fprintf(stderr, "submit_recv_payload: buf_size=%zu, recv_offset=%zu, remaining=%zu, buf_ptr=%p\n",
-    //         ctx->recv_payload_buf.size(), ctx->recv_offset, remaining, buf_ptr);
-    
     io_uring_prep_recv(sqe, sock_fd, buf_ptr, remaining, 0);
     io_uring_sqe_set_data(sqe, ctx);
     io_uring_submit(&ring);
@@ -214,11 +211,8 @@ void RPCClient::handle_completion(io_uring_cqe* cqe) {
     if (!ctx) return;
 
     int res = cqe->res;
-    fprintf(stderr, "handle_completion: req_id=%lu, state=%d, res=%d\n", 
-            ctx->request_id, (int)ctx->state, res);
     if (res <= 0) {
         // Error or connection was closed
-        fprintf(stderr, "Error: res=%d, closing request %lu\n", res, ctx->request_id);
         ctx->callback(false, ctx->response_header, {});
         std::lock_guard<std::mutex> lock(requests_mutex);
         pending_requests.erase(ctx->request_id);
@@ -228,14 +222,11 @@ void RPCClient::handle_completion(io_uring_cqe* cqe) {
     switch (ctx->state) {
         case IOState::SEND_HEADER_PAYLOAD:
             ctx->send_offset += res;
-            fprintf(stderr, "SEND: sent %d bytes, total %zu/%zu\n", 
-                    res, ctx->send_offset, ctx->send_buffer.size());
             if (ctx->send_offset < ctx->send_buffer.size()) {
                 // Continue sending
                 submit_send(ctx);
             } else {
                 // Send completed, starting receiving header
-                fprintf(stderr, "SEND complete, starting RECV_HEADER\n");
                 ctx->state = IOState::RECV_HEADER;
                 ctx->recv_offset = 0;
                 submit_recv_header(ctx);
@@ -244,8 +235,6 @@ void RPCClient::handle_completion(io_uring_cqe* cqe) {
 
         case IOState::RECV_HEADER:
             ctx->recv_offset += res;
-            fprintf(stderr, "RECV_HEADER: received %d bytes, total %zu/%zu\n",
-                    res, ctx->recv_offset, sizeof(RPCHeader));
             if (ctx->recv_offset < sizeof(RPCHeader)) {
                 // Still receiving header
                 submit_recv_header(ctx);
@@ -254,14 +243,7 @@ void RPCClient::handle_completion(io_uring_cqe* cqe) {
                 memcpy(&ctx->response_header, ctx->recv_header_buf.data(), sizeof(RPCHeader));
                 ctx->response_header.to_host_order();
 
-                fprintf(stderr, "Header received: magic=0x%08x, req_id=%lu, op=%u, payload_size=%u, error=%u\n",
-                        ctx->response_header.magic, ctx->response_header.request_id,
-                        ctx->response_header.operation, ctx->response_header.payload_size,
-                        ctx->response_header.error_code);
-
                 if (ctx->response_header.magic != RPC_MAGIC) {
-                    fprintf(stderr, "Invalid magic number!\n");
-
                     RPCHeader header_copy = ctx->response_header;
                     uint64_t req_id = ctx->request_id;
                     
@@ -276,14 +258,12 @@ void RPCClient::handle_completion(io_uring_cqe* cqe) {
 
                 if (ctx->response_header.payload_size > 0) {
                     // Receiving payload...
-                    fprintf(stderr, "Starting RECV_PAYLOAD (%u bytes)\n", ctx->response_header.payload_size);
                     ctx->state = IOState::RECV_PAYLOAD;
                     ctx->recv_offset = 0;
                     ctx->recv_payload_buf.resize(ctx->response_header.payload_size);
                     submit_recv_payload(ctx);
                 } else {
                     // Finished receiving payload
-                    fprintf(stderr, "No payload, completing\n");
                     ctx->state = IOState::COMPLETE;
                     bool success = (ctx->response_header.error_code == 
                                     static_cast<uint32_t>(RPCError::SUCCESS));
@@ -303,26 +283,12 @@ void RPCClient::handle_completion(io_uring_cqe* cqe) {
 
         case IOState::RECV_PAYLOAD:
             ctx->recv_offset += res;
-            fprintf(stderr, "RECV_PAYLOAD: received %d bytes, total %zu/%zu\n",
-                    res, ctx->recv_offset, ctx->recv_payload_buf.size());
-
-            // Debug: show what we just received
-            fprintf(stderr, "Buffer contents at offset %zu: ", ctx->recv_offset - res);
-            for (int i = 0; i < std::min(res, 20); i++) {
-                fprintf(stderr, "%02x ", ctx->recv_payload_buf[ctx->recv_offset - res + i]);
-            }
-            fprintf(stderr, "\n");
 
             if (ctx->recv_offset < ctx->recv_payload_buf.size()) {
                 // Continue receiving payload
                 submit_recv_payload(ctx);
             } else {
                 // Payload complete
-                fprintf(stderr, "Payload complete, full buffer: ");
-                for (size_t i = 0; i < std::min(ctx->recv_payload_buf.size(), size_t(20)); i++) {
-                    fprintf(stderr, "%02x ", ctx->recv_payload_buf[i]);
-                }
-                fprintf(stderr, "\n");
                 ctx->state = IOState::COMPLETE;
                 bool success = (ctx->response_header.error_code ==
                                 static_cast<uint32_t>(RPCError::SUCCESS));
@@ -331,12 +297,6 @@ void RPCClient::handle_completion(io_uring_cqe* cqe) {
                 RPCHeader header_copy = ctx->response_header;
                 std::vector<uint8_t> payload_copy = ctx->recv_payload_buf;
                 uint64_t req_id = ctx->request_id;
-
-                fprintf(stderr, "After copy, payload_copy size=%zu, first bytes: ", payload_copy.size());
-                for (size_t i = 0; i < std::min(payload_copy.size(), size_t(20)); i++) {
-                    fprintf(stderr, "%02x ", payload_copy[i]);
-                }
-                fprintf(stderr, "\n");
 
                 // Invoke callback AFTER removing from map to avoid use-after-free
                 {
@@ -352,7 +312,6 @@ void RPCClient::handle_completion(io_uring_cqe* cqe) {
 
         case IOState::COMPLETE:
             // Should not happen
-            fprintf(stderr, "WARNING: Completion in COMPLETE state\n");
             break;
     }
 }
@@ -400,34 +359,18 @@ void RPCClient::hash_compute_async(const void* data, size_t size, HashCallback c
     async_request(header, payload, 
         [callback](bool success, const RPCHeader& resp_header, 
         const std::vector<uint8_t>& resp_payload) {
-            fprintf(stderr, "Response callback: success=%d, payload_size=%zu, error_code=%u\n",
-                    success, resp_payload.size(), resp_header.error_code);
             if (!success) {
-                fprintf(stderr, "Hash compute failed: success=false\n");
                 callback(false, nullptr);
                 return;
             }
 
-            // Debug: print raw payload
-            fprintf(stderr, "Raw payload bytes: ");
-            for (size_t i = 0; i < std::min(resp_payload.size(), size_t(65)); i++) {
-                fprintf(stderr, "%02x ", resp_payload[i]);
-            }
-            fprintf(stderr, "\n");
-            
-            fprintf(stderr, "As string: '%.*s'\n", (int)resp_payload.size(), resp_payload.data());
-            
             // Allocate on stack - callback happens synchronously before lambda exits
             char hash[65] = {0};
             bool deser_result = HashComputeResponse::deserialize(resp_payload, hash);
-            fprintf(stderr, "Deserialize result: %d, hash: '%s', len=%zu\n", 
-                    deser_result, hash, strlen(hash));
             
             if (deser_result) {
-                fprintf(stderr, "Hash computed: %s\n", hash);
                 callback(true, hash);
             } else {
-                fprintf(stderr, "Hash deserialize failed\n");
                 callback(false, nullptr);
             }      
         });
@@ -526,28 +469,21 @@ bool RPCClient::hash_compute(const void* data, size_t size, char* hash_out) {
     bool result = false;
     char hash_buffer[65] = {0};
 
-    fprintf(stderr, "hash_compute: Starting async request\n");
-
     hash_compute_async(data, size, [&](bool success, const char* hash) {
-        fprintf(stderr, "hash_compute callback: success=%d\n", success);
         std::lock_guard<std::mutex> lock(mtx);
         result = success;
         if (success && hash) {
-            fprintf(stderr, "hash_compute callback: copying hash: %s\n", hash);
             memcpy(hash_buffer, hash, 65);
         }
         done = true;
         cv.notify_one();
     });
-    
-    fprintf(stderr, "hash_compute: Waiting for response\n");
+
     std::unique_lock<std::mutex> lock(mtx);
     cv.wait(lock, [&] { return done; });
 
-    fprintf(stderr, "hash_compute: Done waiting, result=%d\n", result);
     if (result && hash_out) {
         memcpy(hash_out, hash_buffer, 65);
-        fprintf(stderr, "hash_compute: Copied to output: %s\n", hash_out);
     }
     return result;
 }

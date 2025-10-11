@@ -32,7 +32,6 @@ TEST(hash_compute_simple) {
     
     // Expected SHA-256 of "Hello, World!"
     const char* expected = "dffd6021bb2bd5b0af676290809ec3a53191dd81c7f70a4b28688a362182986f";
-    std::cout << hash << std::endl;
     assert(strcmp(hash, expected) == 0 && "Hash mismatch");
 }
 
