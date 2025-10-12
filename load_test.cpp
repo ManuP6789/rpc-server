@@ -254,9 +254,10 @@ void LoadGenerator::worker_thread_async(int worker_id, double target_rate,
                 
                 switch (op) {
                 case 0: {
-                    auto data = generate_random_data(1024, seed);
-                    client.hash_compute_async(data.data(), data.size(), 
-                        [&stats, &in_flight, start](bool success, const char* hash) {
+                    // Copy data into shared_ptr so it outlives the async call
+                    auto data = std::make_shared<std::vector<uint8_t>>(generate_random_data(1024, seed));
+                    client.hash_compute_async(data->data(), data->size(), 
+                        [&stats, &in_flight, start, data](bool success, const char* hash) {
                             auto end = std::chrono::high_resolution_clock::now();
                             if (success) {
                                 double latency = std::chrono::duration<double, std::milli>(end - start).count();
@@ -269,14 +270,14 @@ void LoadGenerator::worker_thread_async(int worker_id, double target_rate,
                     break;
                 }
                 case 1: {
-                    std::vector<int32_t> array(1000);
+                    auto array = std::make_shared<std::vector<int32_t>>(1000);
                     std::mt19937 arr_gen(seed);
                     std::uniform_int_distribution<int32_t> arr_dist(-1000000, 1000000);
                     for (size_t i = 0; i < 1000; i++) {
-                        array[i] = arr_dist(arr_gen);
+                        (*array)[i] = arr_dist(arr_gen);
                     }
-                    client.sort_array_async(array.data(), 1000,
-                        [&stats, &in_flight, start](bool success, const std::vector<int32_t>& sorted) {
+                    client.sort_array_async(array->data(), 1000,
+                        [&stats, &in_flight, start, array](bool success, const std::vector<int32_t>& sorted) {
                             auto end = std::chrono::high_resolution_clock::now();
                             if (success) {
                                 double latency = std::chrono::duration<double, std::milli>(end - start).count();
@@ -289,16 +290,16 @@ void LoadGenerator::worker_thread_async(int worker_id, double target_rate,
                     break;
                 }
                 case 2: {
-                    std::vector<double> matA(16 * 16);
-                    std::vector<double> matB(16 * 16);
+                    auto matA = std::make_shared<std::vector<double>>(16 * 16);
+                    auto matB = std::make_shared<std::vector<double>>(16 * 16);
                     std::mt19937 mat_gen(seed);
                     std::uniform_real_distribution<double> mat_dist(0.0, 1.0);
                     for (uint32_t i = 0; i < 16 * 16; i++) {
-                        matA[i] = mat_dist(mat_gen);
-                        matB[i] = mat_dist(mat_gen);
+                        (*matA)[i] = mat_dist(mat_gen);
+                        (*matB)[i] = mat_dist(mat_gen);
                     }
-                    client.matrix_multiply_async(matA.data(), matB.data(), 16,
-                        [&stats, &in_flight, start](bool success, const std::vector<double>& result, uint32_t n) {
+                    client.matrix_multiply_async(matA->data(), matB->data(), 16,
+                        [&stats, &in_flight, start, matA, matB](bool success, const std::vector<double>& result, uint32_t n) {
                             auto end = std::chrono::high_resolution_clock::now();
                             if (success) {
                                 double latency = std::chrono::duration<double, std::milli>(end - start).count();
@@ -311,9 +312,9 @@ void LoadGenerator::worker_thread_async(int worker_id, double target_rate,
                     break;
                 }
                 case 3: {
-                    auto data = generate_random_data(4096, seed);
-                    client.compress_data_async(CompressionAlgo::ZLIB, data.data(), data.size(),
-                        [&stats, &in_flight, start](bool success, const std::vector<uint8_t>& compressed) {
+                    auto data = std::make_shared<std::vector<uint8_t>>(generate_random_data(4096, seed));
+                    client.compress_data_async(CompressionAlgo::ZLIB, data->data(), data->size(),
+                        [&stats, &in_flight, start, data](bool success, const std::vector<uint8_t>& compressed) {
                             auto end = std::chrono::high_resolution_clock::now();
                             if (success) {
                                 double latency = std::chrono::duration<double, std::milli>(end - start).count();
@@ -370,18 +371,65 @@ void LoadGenerator::run_load_test(double requests_per_sec, int duration_sec,
         }
     }
     
-    // Run for specified duration
-    std::this_thread::sleep_for(std::chrono::seconds(duration_sec));
+    // Monitor progress during the test
+    auto start_time = std::chrono::steady_clock::now();
+    uint64_t last_success = 0;
+    uint64_t last_error = 0;
+    
+    for (int elapsed = 0; elapsed < duration_sec; elapsed += 5) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        
+        auto curr_success = stats.success_count.load();
+        auto curr_error = stats.error_count.load();
+        
+        uint64_t success_delta = curr_success - last_success;
+        uint64_t error_delta = curr_error - last_error;
+        double success_rate = success_delta / 5.0;
+        double error_rate = error_delta / 5.0;
+        
+        std::cout << "[" << (elapsed + 5) << "s] "
+                  << "Success: " << curr_success 
+                  << " (+" << success_delta << ", " << success_rate << " req/s)"
+                  << " | Errors: " << curr_error 
+                  << " (+" << error_delta << ", " << error_rate << " err/s)";
+        
+        if (error_rate > 0) {
+            std::cout << " ⚠️ ERRORS DETECTED";
+        }
+        if (success_rate < requests_per_sec * 0.5) {
+            std::cout << " ⚠️ LOW THROUGHPUT";
+        }
+        if (success_delta == 0 && elapsed > 5) {
+            std::cout << " ❌ NO PROGRESS - STUCK!";
+        }
+        std::cout << "\n";
+        
+        last_success = curr_success;
+        last_error = curr_error;
+    }
     
     // Stop workers
+    std::cout << "Stopping workers...\n";
     running.store(false);
-    for (auto& worker : workers) {
-        worker.join();
+    
+    // Wait with timeout
+    auto join_start = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < workers.size(); i++) {
+        if (workers[i].joinable()) {
+            workers[i].join();
+            std::cout << "Worker " << i << " stopped\n";
+        }
+    }
+    auto join_end = std::chrono::steady_clock::now();
+    auto join_time = std::chrono::duration_cast<std::chrono::seconds>(join_end - join_start).count();
+    
+    if (join_time > 5) {
+        std::cout << "⚠️ Workers took " << join_time << "s to stop (should be instant)\n";
     }
 }
 
 void LoadGenerator::run_benchmark_suite(const std::string& output_file) {
-    std::vector<double> load_levels = {1000, 5000, 10000, 20000, 30000};
+    std::vector<double> load_levels = {10000, 20000, 30000};
     int duration_sec = 30;
     int num_workers = 4;
     int max_in_flight = 100;  // For async mode

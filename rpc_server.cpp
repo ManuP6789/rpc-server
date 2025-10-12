@@ -5,6 +5,7 @@
 #include <cstring>
 #include <vector>
 #include <map>
+#include <queue>
 #include <iostream>
 #include <openssl/sha.h>
 #include <zlib.h>
@@ -20,6 +21,12 @@ enum class EventType {
     WRITE
 };
 
+// Store a pending request
+struct PendingRequest {
+    RPCHeader header;
+    std::vector<uint8_t> payload;
+};
+
 struct Connection {
     int fd;
     std::vector<uint8_t> read_buffer;
@@ -29,6 +36,10 @@ struct Connection {
     size_t bytes_written;
     bool header_read;
     RPCHeader current_header;
+    
+    // Queue of requests to process
+    std::queue<PendingRequest> request_queue;
+    bool write_in_progress = false;
 };
 
 struct RequestContext {
@@ -45,12 +56,18 @@ private:
     int listen_fd;
     std::map<int, Connection*> connections;
     
-    void handle_hash_compute(Connection* conn, const std::vector<uint8_t>& payload);
-    void handle_sort_array(Connection* conn, const std::vector<uint8_t>& payload);
-    void handle_matrix_multiply(Connection* conn, const std::vector<uint8_t>& payload);
-    void handle_compress_data(Connection* conn, const std::vector<uint8_t>& payload);
+    void process_request(Connection* conn, const PendingRequest& req);
+    void handle_hash_compute(Connection* conn, const RPCHeader& header, 
+                            const std::vector<uint8_t>& payload);
+    void handle_sort_array(Connection* conn, const RPCHeader& header,
+                          const std::vector<uint8_t>& payload);
+    void handle_matrix_multiply(Connection* conn, const RPCHeader& header,
+                               const std::vector<uint8_t>& payload);
+    void handle_compress_data(Connection* conn, const RPCHeader& header,
+                             const std::vector<uint8_t>& payload);
     
-    void send_error(Connection* conn, uint64_t req_id, RPCError error);
+    void send_response(Connection* conn, uint64_t req_id, uint32_t operation,
+                      const std::vector<uint8_t>& payload, RPCError error);
     void add_accept(io_uring* ring, int listen_fd);
     void add_read(io_uring* ring, Connection* conn);
     void add_write(io_uring* ring, Connection* conn);
@@ -64,7 +81,6 @@ public:
 };
 
 RPCServer::RPCServer(uint16_t port) {
-    // Create listening socket
     listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         throw std::runtime_error("Failed to create socket");
@@ -86,7 +102,6 @@ RPCServer::RPCServer(uint16_t port) {
         throw std::runtime_error("Failed to listen on socket");
     }
     
-    // Initialize io_uring
     if (io_uring_queue_init(QUEUE_DEPTH, &ring, 0) < 0) {
         throw std::runtime_error("Failed to initialize io_uring");
     }
@@ -141,12 +156,32 @@ void RPCServer::add_write(io_uring* ring, Connection* conn) {
     io_uring_sqe_set_data(sqe, ctx);
 }
 
-void RPCServer::handle_hash_compute(Connection* conn, 
+void RPCServer::process_request(Connection* conn, const PendingRequest& req) {
+    auto op = static_cast<RPCOperation>(req.header.operation);
+    
+    switch (op) {
+    case RPCOperation::HASH_COMPUTE:
+        handle_hash_compute(conn, req.header, req.payload);
+        break;
+    case RPCOperation::SORT_ARRAY:
+        handle_sort_array(conn, req.header, req.payload);
+        break;
+    case RPCOperation::MATRIX_MULTIPLY:
+        handle_matrix_multiply(conn, req.header, req.payload);
+        break;
+    case RPCOperation::COMPRESS_DATA:
+        handle_compress_data(conn, req.header, req.payload);
+        break;
+    default:
+        send_response(conn, req.header.request_id, 0, {}, RPCError::INVALID_OPERATION);
+    }
+}
+
+void RPCServer::handle_hash_compute(Connection* conn, const RPCHeader& header,
                                     const std::vector<uint8_t>& payload) {
     std::vector<uint8_t> data;
     if (!HashComputeRequest::deserialize(payload, data)) {
-        send_error(conn, conn->current_header.request_id, 
-                  RPCError::INVALID_PARAMS);
+        send_response(conn, header.request_id, header.operation, {}, RPCError::INVALID_PARAMS);
         return;
     }
     
@@ -159,72 +194,36 @@ void RPCServer::handle_hash_compute(Connection* conn,
     }
     hex_hash[64] = '\0';
     
-    // Prepare response
-    RPCHeader resp_header;
-    resp_header.request_id = conn->current_header.request_id;
-    resp_header.operation = static_cast<uint32_t>(RPCOperation::HASH_COMPUTE);
-    
     auto resp_payload = HashComputeResponse::serialize(hex_hash);
-    resp_header.payload_size = resp_payload.size();
-    resp_header.error_code = static_cast<uint32_t>(RPCError::SUCCESS);
-    
-    resp_header.to_network_order();
-    
-    conn->write_buffer.resize(sizeof(RPCHeader) + resp_payload.size());
-    memcpy(conn->write_buffer.data(), &resp_header, sizeof(RPCHeader));
-    memcpy(conn->write_buffer.data() + sizeof(RPCHeader), 
-           resp_payload.data(), resp_payload.size());
-    
-    conn->bytes_to_write = conn->write_buffer.size();
-    conn->bytes_written = 0;
-    add_write(&ring, conn);
+    send_response(conn, header.request_id, header.operation, resp_payload, RPCError::SUCCESS);
 }
 
-void RPCServer::handle_sort_array(Connection* conn,
+void RPCServer::handle_sort_array(Connection* conn, const RPCHeader& header,
                                   const std::vector<uint8_t>& payload) {
     std::vector<int32_t> array;
     if (!SortArrayRequest::deserialize(payload, array)) {
-        send_error(conn, conn->current_header.request_id,
-                  RPCError::INVALID_PARAMS);
+        send_response(conn, header.request_id, header.operation, {}, RPCError::INVALID_PARAMS);
         return;
     }
     
     std::sort(array.begin(), array.end());
     
-    RPCHeader resp_header;
-    resp_header.request_id = conn->current_header.request_id;
-    resp_header.operation = static_cast<uint32_t>(RPCOperation::SORT_ARRAY);
-    
     auto resp_payload = SortArrayResponse::serialize(array.data(), array.size());
-    resp_header.payload_size = resp_payload.size();
-    resp_header.error_code = static_cast<uint32_t>(RPCError::SUCCESS);
-    
-    resp_header.to_network_order();
-    
-    conn->write_buffer.resize(sizeof(RPCHeader) + resp_payload.size());
-    memcpy(conn->write_buffer.data(), &resp_header, sizeof(RPCHeader));
-    memcpy(conn->write_buffer.data() + sizeof(RPCHeader),
-           resp_payload.data(), resp_payload.size());
-    
-    conn->bytes_to_write = conn->write_buffer.size();
-    conn->bytes_written = 0;
-    add_write(&ring, conn);
+    send_response(conn, header.request_id, header.operation, resp_payload, RPCError::SUCCESS);
 }
 
-void RPCServer::handle_matrix_multiply(Connection* conn,
+void RPCServer::handle_matrix_multiply(Connection* conn, const RPCHeader& header,
                                        const std::vector<uint8_t>& payload) {
     std::vector<double> matA, matB;
     uint32_t n;
     
     if (!MatrixMultiplyRequest::deserialize(payload, matA, matB, n)) {
-        send_error(conn, conn->current_header.request_id,
-                  RPCError::INVALID_PARAMS);
+        send_response(conn, header.request_id, header.operation, {}, RPCError::INVALID_PARAMS);
         return;
     }
     
     std::vector<double> result(n * n, 0.0);
     
-    // Standard matrix multiplication
     for (uint32_t i = 0; i < n; i++) {
         for (uint32_t j = 0; j < n; j++) {
             for (uint32_t k = 0; k < n; k++) {
@@ -233,34 +232,17 @@ void RPCServer::handle_matrix_multiply(Connection* conn,
         }
     }
     
-    RPCHeader resp_header;
-    resp_header.request_id = conn->current_header.request_id;
-    resp_header.operation = static_cast<uint32_t>(RPCOperation::MATRIX_MULTIPLY);
-    
     auto resp_payload = MatrixMultiplyResponse::serialize(result.data(), n);
-    resp_header.payload_size = resp_payload.size();
-    resp_header.error_code = static_cast<uint32_t>(RPCError::SUCCESS);
-    
-    resp_header.to_network_order();
-    
-    conn->write_buffer.resize(sizeof(RPCHeader) + resp_payload.size());
-    memcpy(conn->write_buffer.data(), &resp_header, sizeof(RPCHeader));
-    memcpy(conn->write_buffer.data() + sizeof(RPCHeader),
-           resp_payload.data(), resp_payload.size());
-    
-    conn->bytes_to_write = conn->write_buffer.size();
-    conn->bytes_written = 0;
-    add_write(&ring, conn);
+    send_response(conn, header.request_id, header.operation, resp_payload, RPCError::SUCCESS);
 }
 
-void RPCServer::handle_compress_data(Connection* conn,
+void RPCServer::handle_compress_data(Connection* conn, const RPCHeader& header,
                                      const std::vector<uint8_t>& payload) {
     CompressionAlgo algo;
     std::vector<uint8_t> data;
     
     if (!CompressDataRequest::deserialize(payload, algo, data)) {
-        send_error(conn, conn->current_header.request_id,
-                  RPCError::INVALID_PARAMS);
+        send_response(conn, header.request_id, header.operation, {}, RPCError::INVALID_PARAMS);
         return;
     }
     
@@ -272,48 +254,38 @@ void RPCServer::handle_compress_data(Connection* conn,
         
         if (compress(compressed.data(), &compressed_size,
                     data.data(), data.size()) != Z_OK) {
-            send_error(conn, conn->current_header.request_id,
-                      RPCError::COMPUTATION_ERROR);
+            send_response(conn, header.request_id, header.operation, {}, RPCError::COMPUTATION_ERROR);
             return;
         }
         compressed.resize(compressed_size);
     }
     
-    RPCHeader resp_header;
-    resp_header.request_id = conn->current_header.request_id;
-    resp_header.operation = static_cast<uint32_t>(RPCOperation::COMPRESS_DATA);
-    
-    auto resp_payload = CompressDataResponse::serialize(compressed.data(),
-                                                        compressed.size());
-    resp_header.payload_size = resp_payload.size();
-    resp_header.error_code = static_cast<uint32_t>(RPCError::SUCCESS);
-    
-    resp_header.to_network_order();
-    
-    conn->write_buffer.resize(sizeof(RPCHeader) + resp_payload.size());
-    memcpy(conn->write_buffer.data(), &resp_header, sizeof(RPCHeader));
-    memcpy(conn->write_buffer.data() + sizeof(RPCHeader),
-           resp_payload.data(), resp_payload.size());
-    
-    conn->bytes_to_write = conn->write_buffer.size();
-    conn->bytes_written = 0;
-    add_write(&ring, conn);
+    auto resp_payload = CompressDataResponse::serialize(compressed.data(), compressed.size());
+    send_response(conn, header.request_id, header.operation, resp_payload, RPCError::SUCCESS);
 }
 
-void RPCServer::send_error(Connection* conn, uint64_t req_id, RPCError error) {
+void RPCServer::send_response(Connection* conn, uint64_t req_id, uint32_t operation,
+                              const std::vector<uint8_t>& payload, RPCError error) {
     RPCHeader resp_header;
+    resp_header.magic = RPC_MAGIC;
     resp_header.request_id = req_id;
-    resp_header.operation = 0;
-    resp_header.payload_size = 0;
+    resp_header.operation = operation;
+    resp_header.payload_size = payload.size();
     resp_header.error_code = static_cast<uint32_t>(error);
     
     resp_header.to_network_order();
     
-    conn->write_buffer.resize(sizeof(RPCHeader));
+    conn->write_buffer.resize(sizeof(RPCHeader) + payload.size());
     memcpy(conn->write_buffer.data(), &resp_header, sizeof(RPCHeader));
+    if (!payload.empty()) {
+        memcpy(conn->write_buffer.data() + sizeof(RPCHeader), 
+               payload.data(), payload.size());
+    }
     
     conn->bytes_to_write = conn->write_buffer.size();
     conn->bytes_written = 0;
+    conn->write_in_progress = true;
+    
     add_write(&ring, conn);
 }
 
@@ -348,7 +320,6 @@ void RPCServer::run() {
             int bytes_read = cqe->res;
             
             if (bytes_read <= 0) {
-                // Connection closed or error
                 close(ctx->conn->fd);
                 connections.erase(ctx->conn->fd);
                 delete ctx->conn;
@@ -370,44 +341,52 @@ void RPCServer::run() {
                             ctx->conn->bytes_read = 0;
                             ctx->conn->read_buffer.resize(
                                 ctx->conn->current_header.payload_size);
-                            add_read(&ring, ctx->conn);
+                            
+                            if (ctx->conn->current_header.payload_size == 0) {
+                                // No payload, queue immediately
+                                PendingRequest req;
+                                req.header = ctx->conn->current_header;
+                                ctx->conn->request_queue.push(std::move(req));
+                                
+                                ctx->conn->header_read = false;
+                                ctx->conn->bytes_read = 0;
+                                
+                                // Process if not writing
+                                if (!ctx->conn->write_in_progress && !ctx->conn->request_queue.empty()) {
+                                    auto pending = std::move(ctx->conn->request_queue.front());
+                                    ctx->conn->request_queue.pop();
+                                    process_request(ctx->conn, pending);
+                                }
+                                
+                                add_read(&ring, ctx->conn);
+                            } else {
+                                add_read(&ring, ctx->conn);
+                            }
                         }
                     } else {
                         add_read(&ring, ctx->conn);
                     }
                 } else {
                     ctx->conn->bytes_read += bytes_read;
-                    if (ctx->conn->bytes_read == 
-                        ctx->conn->current_header.payload_size) {
-                        // Process request
-                        auto op = static_cast<RPCOperation>(
-                            ctx->conn->current_header.operation);
-                        
-                        switch (op) {
-                        case RPCOperation::HASH_COMPUTE:
-                            handle_hash_compute(ctx->conn, 
-                                              ctx->conn->read_buffer);
-                            break;
-                        case RPCOperation::SORT_ARRAY:
-                            handle_sort_array(ctx->conn, 
-                                            ctx->conn->read_buffer);
-                            break;
-                        case RPCOperation::MATRIX_MULTIPLY:
-                            handle_matrix_multiply(ctx->conn,
-                                                 ctx->conn->read_buffer);
-                            break;
-                        case RPCOperation::COMPRESS_DATA:
-                            handle_compress_data(ctx->conn,
-                                               ctx->conn->read_buffer);
-                            break;
-                        default:
-                            send_error(ctx->conn, 
-                                     ctx->conn->current_header.request_id,
-                                     RPCError::INVALID_OPERATION);
-                        }
+                    if (ctx->conn->bytes_read == ctx->conn->current_header.payload_size) {
+                        // Complete request received, queue it
+                        PendingRequest req;
+                        req.header = ctx->conn->current_header;
+                        req.payload = ctx->conn->read_buffer;
+                        ctx->conn->request_queue.push(std::move(req));
                         
                         ctx->conn->header_read = false;
                         ctx->conn->bytes_read = 0;
+                        
+                        // Process if not writing
+                        if (!ctx->conn->write_in_progress && !ctx->conn->request_queue.empty()) {
+                            auto pending = std::move(ctx->conn->request_queue.front());
+                            ctx->conn->request_queue.pop();
+                            process_request(ctx->conn, pending);
+                        }
+                        
+                        // Keep reading more requests
+                        add_read(&ring, ctx->conn);
                     } else {
                         add_read(&ring, ctx->conn);
                     }
@@ -423,8 +402,15 @@ void RPCServer::run() {
             } else {
                 ctx->conn->bytes_written += bytes_written;
                 if (ctx->conn->bytes_written == ctx->conn->bytes_to_write) {
-                    // Response sent, ready for next request
-                    add_read(&ring, ctx->conn);
+                    // Response sent
+                    ctx->conn->write_in_progress = false;
+                    
+                    // Process next queued request if any
+                    if (!ctx->conn->request_queue.empty()) {
+                        auto pending = std::move(ctx->conn->request_queue.front());
+                        ctx->conn->request_queue.pop();
+                        process_request(ctx->conn, pending);
+                    }
                 } else {
                     add_write(&ring, ctx->conn);
                 }

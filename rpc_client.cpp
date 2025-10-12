@@ -13,9 +13,12 @@
 #include <iostream>
 #include <mutex>
 #include <condition_variable>
+#include <queue>
 #include "rpc_protocol.h"
 
-constexpr int CLIENT_QUEUE_DEPTH = 64;
+constexpr int CLIENT_QUEUE_DEPTH = 256;
+
+// Forward declarations
 class RPCClient;
 
 // Callback types
@@ -25,32 +28,34 @@ using SortCallback = std::function<void(bool success, const std::vector<int32_t>
 using MatrixCallback = std::function<void(bool success, const std::vector<double>&, uint32_t n)>;
 using CompressCallback = std::function<void(bool success, const std::vector<uint8_t>&)>;
 
-enum class IOState {
-    SEND_HEADER_PAYLOAD,
-    RECV_HEADER,
-    RECV_PAYLOAD,
-    COMPLETE
-};
-
-struct RequestContext {
+// Pending request info - stores callback, doesn't do IO
+struct PendingRequest {
     uint64_t request_id;
-    IOState state;
-    
-    // Send buffers
-    std::vector<uint8_t> send_buffer;
-    size_t send_offset;
-    
-    // Receive buffers
-    std::vector<uint8_t> recv_header_buf;
-    size_t recv_offset;
-    std::vector<uint8_t> recv_payload_buf;
-    
-    RPCHeader response_header;
     ResponseCallback callback;
     
-    RequestContext(uint64_t id) 
-        : request_id(id), state(IOState::SEND_HEADER_PAYLOAD),
-          send_offset(0), recv_header_buf(sizeof(RPCHeader)), recv_offset(0) {}
+    PendingRequest(uint64_t id, ResponseCallback cb)
+        : request_id(id), callback(std::move(cb)) {}
+};
+
+// Receiver state - handles reading from socket
+enum class RecvState {
+    READING_HEADER,
+    READING_PAYLOAD
+};
+
+struct ReceiverContext {
+    RecvState state = RecvState::READING_HEADER;
+    std::vector<uint8_t> header_buf;
+    RPCHeader current_header;
+    std::vector<uint8_t> payload_buf;
+    size_t bytes_read = 0;
+    
+    ReceiverContext() : header_buf(sizeof(RPCHeader)) {}
+};
+
+enum class OpType {
+    SEND,
+    RECV
 };
 
 class RPCClient {
@@ -61,14 +66,30 @@ private:
     std::atomic<bool> running{false};
     std::thread io_thread;
     
-    std::unordered_map<uint64_t, std::unique_ptr<RequestContext>> pending_requests;
+    // Map of request_id -> callback
+    std::unordered_map<uint64_t, std::unique_ptr<PendingRequest>> pending_requests;
     std::mutex requests_mutex;
-
+    
+    // Send queue
+    std::queue<std::vector<uint8_t>> send_queue;
+    std::mutex send_mutex;
+    bool send_in_progress = false;
+    std::vector<uint8_t> current_send_buffer;
+    size_t send_offset = 0;
+    
+    // Single receiver for the socket
+    ReceiverContext receiver;
+    
+    // OpType markers - NOT static, instance members
+    OpType send_op_marker = OpType::SEND;
+    OpType recv_op_marker = OpType::RECV;
+    
     void io_loop();
-    void submit_send(RequestContext* ctx);
-    void submit_recv_header(RequestContext* ctx);
-    void submit_recv_payload(RequestContext* ctx);
-    void handle_completion(io_uring_cqe* cqe);
+    void submit_send();
+    void submit_recv();
+    void handle_send_completion(int bytes_sent);
+    void handle_recv_completion(int bytes_received);
+    void dispatch_response(const RPCHeader& header, const std::vector<uint8_t>& payload);
     
     void async_request(const RPCHeader& header, 
                       const std::vector<uint8_t>& payload,
@@ -77,7 +98,7 @@ private:
 public:
     RPCClient(const char* host, uint16_t port);
     ~RPCClient();
-
+    
     // Async API with callbacks
     void hash_compute_async(const void* data, size_t size, HashCallback callback);
     void sort_array_async(const int32_t* array, size_t size, SortCallback callback);
@@ -86,6 +107,7 @@ public:
     void compress_data_async(CompressionAlgo algo, const void* data,
                            size_t size, CompressCallback callback);
     
+    // Synchronous wrappers
     bool hash_compute(const void* data, size_t size, char* hash_out);
     bool sort_array(int32_t* array, size_t size);
     bool matrix_multiply(const double* matA, const double* matB, 
@@ -118,11 +140,13 @@ RPCClient::RPCClient(const char* host, uint16_t port) {
         close(sock_fd);
         throw std::runtime_error("Failed to initialize io_uring");
     }
-
+    
     running = true;
     io_thread = std::thread(&RPCClient::io_loop, this);
-
-    // Give IO thread time to start
+    
+    // Start receiving immediately
+    submit_recv();
+    
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
 
@@ -139,12 +163,11 @@ void RPCClient::io_loop() {
     while (running) {
         io_uring_cqe* cqe;
         
-        // Wait for completion with timeout
         __kernel_timespec ts = {0, 100000000}; // 100ms
         int ret = io_uring_wait_cqe_timeout(&ring, &cqe, &ts);
         
         if (ret == -ETIME) {
-            continue; // Timeout, check running flag
+            continue;
         }
         
         if (ret < 0) {
@@ -154,197 +177,214 @@ void RPCClient::io_loop() {
             continue;
         }
         
-        handle_completion(cqe);
+        // Check if this is send or recv
+        OpType* op_type = static_cast<OpType*>(io_uring_cqe_get_data(cqe));
+        int res = cqe->res;
+        
+        if (res <= 0) {
+            fprintf(stderr, "IO error: %d\n", res);
+            io_uring_cqe_seen(&ring, cqe);
+            continue;
+        }
+        
+        if (*op_type == OpType::SEND) {
+            handle_send_completion(res);
+        } else {
+            handle_recv_completion(res);
+        }
+        
         io_uring_cqe_seen(&ring, cqe);
     }
 }
 
-void RPCClient::submit_send(RequestContext* ctx) {
-    io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-    if (!sqe) {
-        std::cerr << "Failed to get SQE\n";
-        return;
-    }
-
-    size_t remaining = ctx->send_buffer.size() - ctx->send_offset;
-    io_uring_prep_send(sqe, sock_fd, 
-                      ctx->send_buffer.data() + ctx->send_offset,
-                      remaining, 0);
-
-    io_uring_sqe_set_data(sqe, ctx);
-    io_uring_submit(&ring);
-}
-
-void RPCClient::submit_recv_header(RequestContext* ctx) {
-    io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-    if (!sqe) {
-        std::cerr << "Failed to get SQE\n";
-        return;
-    }
-
-    size_t remaining = sizeof(RPCHeader) - ctx->recv_offset;
-    io_uring_prep_recv(sqe, sock_fd,
-                       ctx->recv_header_buf.data() + ctx->recv_offset,
-                       remaining, 0);
-                    
-    io_uring_sqe_set_data(sqe, ctx);
-    io_uring_submit(&ring);
-}
-
-void RPCClient::submit_recv_payload(RequestContext* ctx) {
-    io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-    if (!sqe) {
-        std::cerr << "Failed to get SQE\n";
-        return;
-    }
-
-    size_t remaining = ctx->recv_payload_buf.size() - ctx->recv_offset;
-    void* buf_ptr = ctx->recv_payload_buf.data() + ctx->recv_offset;
+void RPCClient::submit_send() {
+    std::lock_guard<std::mutex> lock(send_mutex);
     
-    io_uring_prep_recv(sqe, sock_fd, buf_ptr, remaining, 0);
-    io_uring_sqe_set_data(sqe, ctx);
+    if (send_in_progress || send_queue.empty()) {
+        return;
+    }
+    
+    current_send_buffer = std::move(send_queue.front());
+    send_queue.pop();
+    send_offset = 0;
+    send_in_progress = true;
+    
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        fprintf(stderr, "Failed to get SQE for send\n");
+        return;
+    }
+    
+    io_uring_prep_send(sqe, sock_fd,
+                      current_send_buffer.data(),
+                      current_send_buffer.size(), 0);
+    io_uring_sqe_set_data(sqe, &send_op_marker);
     io_uring_submit(&ring);
 }
 
-void RPCClient::handle_completion(io_uring_cqe* cqe) {
-    RequestContext* ctx = static_cast<RequestContext*>(io_uring_cqe_get_data(cqe));
-    if (!ctx) return;
-
-    int res = cqe->res;
-    if (res <= 0) {
-        // Error or connection was closed
-        ctx->callback(false, ctx->response_header, {});
-        std::lock_guard<std::mutex> lock(requests_mutex);
-        pending_requests.erase(ctx->request_id);
+void RPCClient::submit_recv() {
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        fprintf(stderr, "Failed to get SQE for recv\n");
         return;
-    } 
+    }
+    
+    if (receiver.state == RecvState::READING_HEADER) {
+        size_t remaining = sizeof(RPCHeader) - receiver.bytes_read;
+        io_uring_prep_recv(sqe, sock_fd,
+                          receiver.header_buf.data() + receiver.bytes_read,
+                          remaining, 0);
+    } else {
+        size_t remaining = receiver.payload_buf.size() - receiver.bytes_read;
+        io_uring_prep_recv(sqe, sock_fd,
+                          receiver.payload_buf.data() + receiver.bytes_read,
+                          remaining, 0);
+    }
+    
+    io_uring_sqe_set_data(sqe, &recv_op_marker);
+    io_uring_submit(&ring);
+}
 
-    switch (ctx->state) {
-        case IOState::SEND_HEADER_PAYLOAD:
-            ctx->send_offset += res;
-            if (ctx->send_offset < ctx->send_buffer.size()) {
-                // Continue sending
-                submit_send(ctx);
-            } else {
-                // Send completed, starting receiving header
-                ctx->state = IOState::RECV_HEADER;
-                ctx->recv_offset = 0;
-                submit_recv_header(ctx);
-            }
-            break;
-
-        case IOState::RECV_HEADER:
-            ctx->recv_offset += res;
-            if (ctx->recv_offset < sizeof(RPCHeader)) {
-                // Still receiving header
-                submit_recv_header(ctx);
-            } else {
-                // Header succesfully received, now parsing...
-                memcpy(&ctx->response_header, ctx->recv_header_buf.data(), sizeof(RPCHeader));
-                ctx->response_header.to_host_order();
-
-                if (ctx->response_header.magic != RPC_MAGIC) {
-                    RPCHeader header_copy = ctx->response_header;
-                    uint64_t req_id = ctx->request_id;
-                    
-                    {
-                        std::lock_guard<std::mutex> lock(requests_mutex);
-                        auto callback_copy = std::move(ctx->callback);
-                        pending_requests.erase(req_id);
-                        callback_copy(false, header_copy, {});
-                    }
-                    return;
-                }
-
-                if (ctx->response_header.payload_size > 0) {
-                    // Receiving payload...
-                    ctx->state = IOState::RECV_PAYLOAD;
-                    ctx->recv_offset = 0;
-                    ctx->recv_payload_buf.resize(ctx->response_header.payload_size);
-                    submit_recv_payload(ctx);
-                } else {
-                    // Finished receiving payload
-                    ctx->state = IOState::COMPLETE;
-                    bool success = (ctx->response_header.error_code == 
-                                    static_cast<uint32_t>(RPCError::SUCCESS));
-
-                    RPCHeader header_copy = ctx->response_header;
-                    uint64_t req_id = ctx->request_id;
-                    
-                    {
-                        std::lock_guard<std::mutex> lock(requests_mutex);
-                        auto callback_copy = std::move(ctx->callback);
-                        pending_requests.erase(req_id);
-                        callback_copy(success, header_copy, {});
-                    }
-                }
-            }
-            break;
-
-        case IOState::RECV_PAYLOAD:
-            ctx->recv_offset += res;
-
-            if (ctx->recv_offset < ctx->recv_payload_buf.size()) {
-                // Continue receiving payload
-                submit_recv_payload(ctx);
-            } else {
-                // Payload complete
-                ctx->state = IOState::COMPLETE;
-                bool success = (ctx->response_header.error_code ==
-                                static_cast<uint32_t>(RPCError::SUCCESS));
-                
-                // Copy data before erasing context 
-                RPCHeader header_copy = ctx->response_header;
-                std::vector<uint8_t> payload_copy = ctx->recv_payload_buf;
-                uint64_t req_id = ctx->request_id;
-
-                // Invoke callback AFTER removing from map to avoid use-after-free
-                {
-                    std::lock_guard<std::mutex> lock(requests_mutex);
-                    auto callback_copy = std::move(ctx->callback);
-                    pending_requests.erase(req_id);
-                    
-                    // Now invoke with copied data
-                    callback_copy(success, header_copy, payload_copy);
-                }
-            }
-            break;
-
-        case IOState::COMPLETE:
-            // Should not happen
-            break;
+void RPCClient::handle_send_completion(int bytes_sent) {
+    std::lock_guard<std::mutex> lock(send_mutex);
+    
+    send_offset += bytes_sent;
+    
+    if (send_offset < current_send_buffer.size()) {
+        // More to send
+        io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        if (!sqe) {
+            fprintf(stderr, "Failed to get SQE for continued send\n");
+            return;
+        }
+        
+        io_uring_prep_send(sqe, sock_fd,
+                          current_send_buffer.data() + send_offset,
+                          current_send_buffer.size() - send_offset, 0);
+        io_uring_sqe_set_data(sqe, &send_op_marker);
+        io_uring_submit(&ring);
+    } else {
+        // Send complete, check queue
+        send_in_progress = false;
+        current_send_buffer.clear();
+        
+        if (!send_queue.empty()) {
+            submit_send();
+        }
     }
 }
 
-void RPCClient::async_request(const RPCHeader& header, 
-                              const std::vector<uint8_t>& payload,
-                              ResponseCallback callback) 
-    {
-        auto ctx = std::make_unique<RequestContext>(header.request_id);
-        ctx->callback = std::move(callback);
+void RPCClient::handle_recv_completion(int bytes_received) {
+    receiver.bytes_read += bytes_received;
+    
+    if (receiver.state == RecvState::READING_HEADER) {
 
-        // Send buffer
-        ctx->send_buffer.resize(sizeof(RPCHeader) + payload.size());
-
-        RPCHeader net_header = header;
-        net_header.to_network_order();
-
-        memcpy(ctx->send_buffer.data(), &net_header, sizeof(RPCHeader));
-        if (!payload.empty()) {
-            memcpy(ctx->send_buffer.data() + sizeof(RPCHeader), payload.data(),
-                    payload.size());                
+        if (receiver.bytes_read < sizeof(RPCHeader)) {
+            // Need more header bytes
+            submit_recv();
+            return;
         }
-
-        RequestContext* ctx_ptr = ctx.get();
         
-        // Explain this line cause wth
-        {
+        // Complete header received
+        memcpy(&receiver.current_header, receiver.header_buf.data(), sizeof(RPCHeader));
+        receiver.current_header.to_host_order();
+        
+        if (receiver.current_header.magic != RPC_MAGIC) {
+            fprintf(stderr, "Invalid magic: 0x%08x\n", receiver.current_header.magic);
+            // Dispatch error to all pending requests
             std::lock_guard<std::mutex> lock(requests_mutex);
-            pending_requests[header.request_id] = std::move(ctx);
+            for (auto& [id, req] : pending_requests) {
+                req->callback(false, receiver.current_header, {});
+            }
+            pending_requests.clear();
+            return;
         }
-
-        submit_send(ctx_ptr);
+        
+        if (receiver.current_header.payload_size > 0) {
+            // Start reading payload
+            receiver.state = RecvState::READING_PAYLOAD;
+            receiver.payload_buf.resize(receiver.current_header.payload_size);
+            receiver.bytes_read = 0;
+            submit_recv();
+        } else {
+            // No payload, dispatch immediately
+            dispatch_response(receiver.current_header, {});
+            
+            // Reset for next response
+            receiver.state = RecvState::READING_HEADER;
+            receiver.bytes_read = 0;
+            submit_recv();
+        }
+    } else {
+        // Reading payload        
+        if (receiver.bytes_read < receiver.payload_buf.size()) {
+            // Need more payload bytes
+            submit_recv();
+            return;
+        }
+        
+        // Complete response received
+        dispatch_response(receiver.current_header, receiver.payload_buf);
+        
+        // Reset for next response
+        receiver.state = RecvState::READING_HEADER;
+        receiver.bytes_read = 0;
+        receiver.payload_buf.clear();
+        submit_recv();
     }
+}
+
+void RPCClient::dispatch_response(const RPCHeader& header, const std::vector<uint8_t>& payload) {
+    std::unique_ptr<PendingRequest> req;
+    
+    {
+        std::lock_guard<std::mutex> lock(requests_mutex);
+        auto it = pending_requests.find(header.request_id);
+        
+        if (it == pending_requests.end()) {
+            fprintf(stderr, "Received response for unknown request_id: %lu\n", header.request_id);
+            return;
+        }
+        
+        req = std::move(it->second);
+        pending_requests.erase(it);
+    }
+    
+    // Invoke callback outside lock
+    bool success = (header.error_code == static_cast<uint32_t>(RPCError::SUCCESS));
+    req->callback(success, header, payload);
+}
+
+void RPCClient::async_request(const RPCHeader& header,
+                              const std::vector<uint8_t>& payload,
+                              ResponseCallback callback) {
+    
+    // Register callback
+    {
+        std::lock_guard<std::mutex> lock(requests_mutex);
+        pending_requests[header.request_id] = std::make_unique<PendingRequest>(header.request_id, std::move(callback));
+    }
+    
+    // Prepare send buffer
+    std::vector<uint8_t> send_buf(sizeof(RPCHeader) + payload.size());
+    
+    RPCHeader net_header = header;
+    net_header.to_network_order();
+    
+    memcpy(send_buf.data(), &net_header, sizeof(RPCHeader));
+    if (!payload.empty()) {
+        memcpy(send_buf.data() + sizeof(RPCHeader), payload.data(), payload.size());
+    }
+        
+    // Queue for sending
+    {
+        std::lock_guard<std::mutex> lock(send_mutex);
+        send_queue.push(std::move(send_buf));
+    }
+    
+    // Kick off send if not in progress
+    submit_send();
+}
 
 void RPCClient::hash_compute_async(const void* data, size_t size, HashCallback callback) {
     RPCHeader header;
@@ -352,27 +392,23 @@ void RPCClient::hash_compute_async(const void* data, size_t size, HashCallback c
     header.request_id = next_request_id++;
     header.operation = static_cast<uint32_t>(RPCOperation::HASH_COMPUTE);
     header.error_code = 0;
-
+    
     auto payload = HashComputeRequest::serialize(data, size);
     header.payload_size = payload.size();
-
-    async_request(header, payload, 
-        [callback](bool success, const RPCHeader& resp_header, 
-        const std::vector<uint8_t>& resp_payload) {
+    
+    async_request(header, payload,
+        [callback](bool success, const RPCHeader&, const std::vector<uint8_t>& resp_payload) {
             if (!success) {
                 callback(false, nullptr);
                 return;
             }
-
-            // Allocate on stack - callback happens synchronously before lambda exits
-            char hash[65] = {0};
-            bool deser_result = HashComputeResponse::deserialize(resp_payload, hash);
             
-            if (deser_result) {
+            char hash[65] = {0};
+            if (HashComputeResponse::deserialize(resp_payload, hash)) {
                 callback(true, hash);
             } else {
                 callback(false, nullptr);
-            }      
+            }
         });
 }
 
@@ -382,47 +418,44 @@ void RPCClient::sort_array_async(const int32_t* array, size_t size, SortCallback
     header.request_id = next_request_id++;
     header.operation = static_cast<uint32_t>(RPCOperation::SORT_ARRAY);
     header.error_code = 0;
-
+    
     auto payload = SortArrayRequest::serialize(array, size);
     header.payload_size = payload.size();
-
-    async_request(header, payload, 
-        [callback](bool success, const RPCHeader& resp_header, 
-        const std::vector<uint8_t>& resp_payload) {
+    
+    async_request(header, payload,
+        [callback](bool success, const RPCHeader&, const std::vector<uint8_t>& resp_payload) {
             if (!success) {
                 callback(false, {});
                 return;
             }
-
+            
             std::vector<int32_t> sorted;
-            if (SortArrayRequest::deserialize(resp_payload, sorted)) {
+            if (SortArrayResponse::deserialize(resp_payload, sorted)) {
                 callback(true, sorted);
             } else {
                 callback(false, {});
             }
-                  
         });
 }
 
-void RPCClient::matrix_multiply_async(const double* matA, const double* matB, 
+void RPCClient::matrix_multiply_async(const double* matA, const double* matB,
                                       uint32_t n, MatrixCallback callback) {
     RPCHeader header;
     header.magic = RPC_MAGIC;
     header.request_id = next_request_id++;
     header.operation = static_cast<uint32_t>(RPCOperation::MATRIX_MULTIPLY);
     header.error_code = 0;
-
+    
     auto payload = MatrixMultiplyRequest::serialize(matA, matB, n);
     header.payload_size = payload.size();
-
-    async_request(header, payload, 
-        [callback](bool success, const RPCHeader& resp_header, 
-        const std::vector<uint8_t>& resp_payload) {
+    
+    async_request(header, payload,
+        [callback](bool success, const RPCHeader&, const std::vector<uint8_t>& resp_payload) {
             if (!success) {
                 callback(false, {}, 0);
                 return;
             }
-
+            
             std::vector<double> result;
             uint32_t result_n;
             if (MatrixMultiplyResponse::deserialize(resp_payload, result, result_n)) {
@@ -430,7 +463,6 @@ void RPCClient::matrix_multiply_async(const double* matA, const double* matB,
             } else {
                 callback(false, {}, 0);
             }
-                  
         });
 }
 
@@ -441,34 +473,34 @@ void RPCClient::compress_data_async(CompressionAlgo algo, const void* data,
     header.request_id = next_request_id++;
     header.operation = static_cast<uint32_t>(RPCOperation::COMPRESS_DATA);
     header.error_code = 0;
-
+    
     auto payload = CompressDataRequest::serialize(algo, data, size);
     header.payload_size = payload.size();
     
-    async_request(header, payload, 
-        [callback](bool success, const RPCHeader& resp_header, 
-        const std::vector<uint8_t>& resp_payload) {
+    async_request(header, payload,
+        [callback](bool success, const RPCHeader&, const std::vector<uint8_t>& resp_payload) {
             if (!success) {
                 callback(false, {});
                 return;
             }
-
+            
             std::vector<uint8_t> compressed;
             if (CompressDataResponse::deserialize(resp_payload, compressed)) {
                 callback(true, compressed);
             } else {
                 callback(false, {});
-            }        
+            }
         });
 }
 
+// Synchronous wrappers
 bool RPCClient::hash_compute(const void* data, size_t size, char* hash_out) {
     std::mutex mtx;
-    std:: condition_variable cv;
+    std::condition_variable cv;
     bool done = false;
     bool result = false;
     char hash_buffer[65] = {0};
-
+    
     hash_compute_async(data, size, [&](bool success, const char* hash) {
         std::lock_guard<std::mutex> lock(mtx);
         result = success;
@@ -478,10 +510,10 @@ bool RPCClient::hash_compute(const void* data, size_t size, char* hash_out) {
         done = true;
         cv.notify_one();
     });
-
+    
     std::unique_lock<std::mutex> lock(mtx);
     cv.wait(lock, [&] { return done; });
-
+    
     if (result && hash_out) {
         memcpy(hash_out, hash_buffer, 65);
     }
@@ -490,10 +522,10 @@ bool RPCClient::hash_compute(const void* data, size_t size, char* hash_out) {
 
 bool RPCClient::sort_array(int32_t* array, size_t size) {
     std::mutex mtx;
-    std:: condition_variable cv;
+    std::condition_variable cv;
     bool done = false;
     bool result = false;
-
+    
     sort_array_async(array, size, [&](bool success, const std::vector<int32_t>& sorted) {
         std::lock_guard<std::mutex> lock(mtx);
         result = success;
@@ -503,20 +535,19 @@ bool RPCClient::sort_array(int32_t* array, size_t size) {
         done = true;
         cv.notify_one();
     });
-
+    
     std::unique_lock<std::mutex> lock(mtx);
     cv.wait(lock, [&] { return done; });
     return result;
-    
 }
 
 bool RPCClient::matrix_multiply(const double* matA, const double* matB,
                                 uint32_t n, double* result) {
     std::mutex mtx;
-    std:: condition_variable cv;
+    std::condition_variable cv;
     bool done = false;
     bool success_flag = false;
-        
+    
     matrix_multiply_async(matA, matB, n, [&](bool success, const std::vector<double>& res, uint32_t result_n) {
         std::lock_guard<std::mutex> lock(mtx);
         success_flag = success;
