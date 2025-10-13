@@ -331,123 +331,129 @@ void RPCServer::run() {
             continue;
         }
         
-        auto* ctx = static_cast<RequestContext*>(io_uring_cqe_get_data(cqe));
-        
-        if (ctx->type == EventType::ACCEPT) {
-            int client_fd = cqe->res;
-            if (client_fd >= 0) {
-                auto* conn = new Connection();
-                conn->fd = client_fd;
-                conn->bytes_read = 0;
-                conn->header_read = false;
-                connections[client_fd] = conn;
+        unsigned head;
+        unsigned count = 0;
+        io_uring_for_each_cqe(&ring, head, cqe) {
+            auto* ctx = static_cast<RequestContext*>(io_uring_cqe_get_data(cqe));
+
+            if (ctx->type == EventType::ACCEPT) {
+                int client_fd = cqe->res;
+                if (client_fd >= 0) {
+                    auto* conn = new Connection();
+                    conn->fd = client_fd;
+                    conn->bytes_read = 0;
+                    conn->header_read = false;
+                    connections[client_fd] = conn;
+                    
+                    add_read(&ring, conn);
+                    add_accept(&ring, listen_fd);
+                }
+            } else if (ctx->type == EventType::READ) {
+                int bytes_read = cqe->res;
                 
-                add_read(&ring, conn);
-                add_accept(&ring, listen_fd);
-            }
-        } else if (ctx->type == EventType::READ) {
-            int bytes_read = cqe->res;
-            
-            if (bytes_read <= 0) {
-                close(ctx->conn->fd);
-                connections.erase(ctx->conn->fd);
-                delete ctx->conn;
-            } else {
-                if (!ctx->conn->header_read) {
-                    ctx->conn->bytes_read += bytes_read;
-                    if (ctx->conn->bytes_read == sizeof(RPCHeader)) {
-                        memcpy(&ctx->conn->current_header, 
-                               ctx->conn->read_buffer.data(),
-                               sizeof(RPCHeader));
-                        ctx->conn->current_header.to_host_order();
-                        
-                        if (ctx->conn->current_header.magic != RPC_MAGIC) {
-                            close(ctx->conn->fd);
-                            connections.erase(ctx->conn->fd);
-                            delete ctx->conn;
-                        } else {
-                            ctx->conn->header_read = true;
-                            ctx->conn->bytes_read = 0;
-                            ctx->conn->read_buffer.resize(
-                                ctx->conn->current_header.payload_size);
+                if (bytes_read <= 0) {
+                    close(ctx->conn->fd);
+                    connections.erase(ctx->conn->fd);
+                    delete ctx->conn;
+                } else {
+                    if (!ctx->conn->header_read) {
+                        ctx->conn->bytes_read += bytes_read;
+                        if (ctx->conn->bytes_read == sizeof(RPCHeader)) {
+                            memcpy(&ctx->conn->current_header, 
+                                ctx->conn->read_buffer.data(),
+                                sizeof(RPCHeader));
+                            ctx->conn->current_header.to_host_order();
                             
-                            if (ctx->conn->current_header.payload_size == 0) {
-                                // No payload, queue immediately
-                                PendingRequest req;
-                                req.header = ctx->conn->current_header;
-                                ctx->conn->request_queue.push(std::move(req));
-                                
-                                ctx->conn->header_read = false;
-                                ctx->conn->bytes_read = 0;
-                                
-                                // Process if not writing
-                                if (!ctx->conn->write_in_progress && !ctx->conn->request_queue.empty()) {
-                                    auto pending = std::move(ctx->conn->request_queue.front());
-                                    ctx->conn->request_queue.pop();
-                                    process_request(ctx->conn, pending);
-                                }
-                                
-                                add_read(&ring, ctx->conn);
+                            if (ctx->conn->current_header.magic != RPC_MAGIC) {
+                                close(ctx->conn->fd);
+                                connections.erase(ctx->conn->fd);
+                                delete ctx->conn;
                             } else {
-                                add_read(&ring, ctx->conn);
+                                ctx->conn->header_read = true;
+                                ctx->conn->bytes_read = 0;
+                                ctx->conn->read_buffer.resize(
+                                    ctx->conn->current_header.payload_size);
+                                
+                                if (ctx->conn->current_header.payload_size == 0) {
+                                    // No payload, queue immediately
+                                    PendingRequest req;
+                                    req.header = ctx->conn->current_header;
+                                    ctx->conn->request_queue.push(std::move(req));
+                                    
+                                    ctx->conn->header_read = false;
+                                    ctx->conn->bytes_read = 0;
+                                    
+                                    // Process if not writing
+                                    if (!ctx->conn->write_in_progress && !ctx->conn->request_queue.empty()) {
+                                        auto pending = std::move(ctx->conn->request_queue.front());
+                                        ctx->conn->request_queue.pop();
+                                        process_request(ctx->conn, pending);
+                                    }
+                                    
+                                    add_read(&ring, ctx->conn);
+                                } else {
+                                    add_read(&ring, ctx->conn);
+                                }
                             }
+                        } else {
+                            add_read(&ring, ctx->conn);
                         }
                     } else {
-                        add_read(&ring, ctx->conn);
+                        ctx->conn->bytes_read += bytes_read;
+                        if (ctx->conn->bytes_read == ctx->conn->current_header.payload_size) {
+                            // Complete request received, queue it
+                            PendingRequest req;
+                            req.header = ctx->conn->current_header;
+                            req.payload = ctx->conn->read_buffer;
+                            ctx->conn->request_queue.push(std::move(req));
+                            
+                            ctx->conn->header_read = false;
+                            ctx->conn->bytes_read = 0;
+                            
+                            // Process if not writing
+                            if (!ctx->conn->write_in_progress && !ctx->conn->request_queue.empty()) {
+                                auto pending = std::move(ctx->conn->request_queue.front());
+                                ctx->conn->request_queue.pop();
+                                process_request(ctx->conn, pending);
+                            }
+                            
+                            // Keep reading more requests
+                            add_read(&ring, ctx->conn);
+                        } else {
+                            add_read(&ring, ctx->conn);
+                        }
                     }
+                }
+            } else if (ctx->type == EventType::WRITE) {
+                int bytes_written = cqe->res;
+                
+                if (bytes_written <= 0) {
+                    close(ctx->conn->fd);
+                    connections.erase(ctx->conn->fd);
+                    delete ctx->conn;
                 } else {
-                    ctx->conn->bytes_read += bytes_read;
-                    if (ctx->conn->bytes_read == ctx->conn->current_header.payload_size) {
-                        // Complete request received, queue it
-                        PendingRequest req;
-                        req.header = ctx->conn->current_header;
-                        req.payload = ctx->conn->read_buffer;
-                        ctx->conn->request_queue.push(std::move(req));
+                    ctx->conn->bytes_written += bytes_written;
+                    if (ctx->conn->bytes_written == ctx->conn->bytes_to_write) {
+                        // Response sent
+                        ctx->conn->write_in_progress = false;
                         
-                        ctx->conn->header_read = false;
-                        ctx->conn->bytes_read = 0;
-                        
-                        // Process if not writing
-                        if (!ctx->conn->write_in_progress && !ctx->conn->request_queue.empty()) {
+                        // Process next queued request if any
+                        if (!ctx->conn->request_queue.empty()) {
                             auto pending = std::move(ctx->conn->request_queue.front());
                             ctx->conn->request_queue.pop();
                             process_request(ctx->conn, pending);
                         }
-                        
-                        // Keep reading more requests
-                        add_read(&ring, ctx->conn);
                     } else {
-                        add_read(&ring, ctx->conn);
+                        add_write(&ring, ctx->conn);
                     }
                 }
             }
-        } else if (ctx->type == EventType::WRITE) {
-            int bytes_written = cqe->res;
-            
-            if (bytes_written <= 0) {
-                close(ctx->conn->fd);
-                connections.erase(ctx->conn->fd);
-                delete ctx->conn;
-            } else {
-                ctx->conn->bytes_written += bytes_written;
-                if (ctx->conn->bytes_written == ctx->conn->bytes_to_write) {
-                    // Response sent
-                    ctx->conn->write_in_progress = false;
-                    
-                    // Process next queued request if any
-                    if (!ctx->conn->request_queue.empty()) {
-                        auto pending = std::move(ctx->conn->request_queue.front());
-                        ctx->conn->request_queue.pop();
-                        process_request(ctx->conn, pending);
-                    }
-                } else {
-                    add_write(&ring, ctx->conn);
-                }
-            }
+            delete ctx;
+            count++;
         }
+        io_uring_cq_advance(&ring, count);
         
-        io_uring_cqe_seen(&ring, cqe);
-        delete ctx;
+        // Submit once after processing all completions
         io_uring_submit(&ring);
     }
 }

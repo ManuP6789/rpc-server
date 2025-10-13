@@ -191,23 +191,30 @@ void RPCClient::io_loop() {
             continue;
         }
         
-        // Check if this is send or recv
-        OpType* op_type = static_cast<OpType*>(io_uring_cqe_get_data(cqe));
-        int res = cqe->res;
-        
-        if (res <= 0) {
-            fprintf(stderr, "IO error: %d\n", res);
-            io_uring_cqe_seen(&ring, cqe);
-            continue;
+        // Process ALL available completions
+        unsigned head;
+        unsigned count = 0;
+        io_uring_for_each_cqe(&ring, head, cqe) {
+            OpType* op_type = static_cast<OpType*>(io_uring_cqe_get_data(cqe));
+            int res = cqe->res;
+            
+            if (res <= 0) {
+                fprintf(stderr, "[CLIENT-%p] IO error: %d\n", this, res);
+            } else {
+                if (*op_type == OpType::SEND) {
+                    handle_send_completion(res);
+                } else {
+                    handle_recv_completion(res);
+                }
+            }
+            count++;
         }
         
-        if (*op_type == OpType::SEND) {
-            handle_send_completion(res);
-        } else {
-            handle_recv_completion(res);
-        }
+        io_uring_cq_advance(&ring, count);
         
-        io_uring_cqe_seen(&ring, cqe);
+        if (count > 1) {
+            fprintf(stderr, "[CLIENT-%p] Processed %u completions in batch\n", this, count);
+        }
     }
 }
 
