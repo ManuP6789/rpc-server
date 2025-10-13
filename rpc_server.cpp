@@ -12,8 +12,8 @@
 #include <algorithm>
 #include "rpc_protocol.h"
 
-constexpr int QUEUE_DEPTH = 256;
-constexpr int BACKLOG = 128;
+constexpr int QUEUE_DEPTH = 1024;
+constexpr int BACKLOG = 1024;
 
 enum class EventType {
     ACCEPT,
@@ -120,6 +120,15 @@ RPCServer::~RPCServer() {
 
 void RPCServer::add_accept(io_uring* ring, int listen_fd) {
     io_uring_sqe* sqe = io_uring_get_sqe(ring);
+    if (!sqe) {
+        fprintf(stderr, "[SERVER] Failed to get SQE for read, submitting first\n");
+        io_uring_submit(ring);  // Submit pending operations
+        sqe = io_uring_get_sqe(ring);  // Try again
+        if (!sqe) {
+            fprintf(stderr, "[SERVER] Still can't get SQE, dropping read!\n");
+            return;
+        }
+    }
     io_uring_prep_accept(sqe, listen_fd, nullptr, nullptr, 0);
     
     auto* ctx = new RequestContext(EventType::ACCEPT);
@@ -128,6 +137,16 @@ void RPCServer::add_accept(io_uring* ring, int listen_fd) {
 
 void RPCServer::add_read(io_uring* ring, Connection* conn) {
     io_uring_sqe* sqe = io_uring_get_sqe(ring);
+
+    if (!sqe) {
+        fprintf(stderr, "[SERVER] Failed to get SQE for read, submitting first\n");
+        io_uring_submit(ring);  // Submit pending operations
+        sqe = io_uring_get_sqe(ring);  // Try again
+        if (!sqe) {
+            fprintf(stderr, "[SERVER] Still can't get SQE, dropping read!\n");
+            return;
+        }
+    }
     
     if (!conn->header_read) {
         conn->read_buffer.resize(sizeof(RPCHeader));
@@ -146,6 +165,16 @@ void RPCServer::add_read(io_uring* ring, Connection* conn) {
 
 void RPCServer::add_write(io_uring* ring, Connection* conn) {
     io_uring_sqe* sqe = io_uring_get_sqe(ring);
+
+    if (!sqe) {
+        fprintf(stderr, "[SERVER] Failed to get SQE for read, submitting first\n");
+        io_uring_submit(ring);  // Submit pending operations
+        sqe = io_uring_get_sqe(ring);  // Try again
+        if (!sqe) {
+            fprintf(stderr, "[SERVER] Still can't get SQE, dropping read!\n");
+            return;
+        }
+    }
     
     size_t remaining = conn->bytes_to_write - conn->bytes_written;
     io_uring_prep_write(sqe, conn->fd,

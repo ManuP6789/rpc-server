@@ -429,7 +429,7 @@ void LoadGenerator::run_load_test(double requests_per_sec, int duration_sec,
 }
 
 void LoadGenerator::run_benchmark_suite(const std::string& output_file) {
-    std::vector<double> load_levels = {10000, 20000, 30000};
+    std::vector<double> load_levels = {1000, 2000, 3000, 5000};
     int duration_sec = 30;
     int num_workers = 4;
     int max_in_flight = 100;  // For async mode
