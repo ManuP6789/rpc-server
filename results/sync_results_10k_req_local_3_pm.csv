@@ -1,0 +1,2 @@
+Mode,RequestsPerSec,AvgLatency,P50,P95,P99,P999,SuccessCount,ErrorCount,Throughput
+SYNC,10000,0.449058,0.394752,0.876793,1.27537,2.17821,243202,0,8106.73

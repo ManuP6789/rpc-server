@@ -52,7 +52,7 @@ def plot_percentile_distribution(df, output_prefix='rpc_analysis'):
     fig, ax = plt.subplots(figsize=(12, 6))
     
     # Select interesting load points
-    load_points = [100, 500, 1000, 2000]
+    load_points = [1000, 2000, 3000, 5000]
     available_loads = [l for l in load_points if l in df['RequestsPerSec'].values]
     
     x = np.arange(len(['P50', 'P95', 'P99', 'P999']))

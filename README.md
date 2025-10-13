@@ -1,13 +1,14 @@
 # High-Performance RPC System with io_uring
 
-A complete Remote Procedure Call (RPC) implementation demonstrating compute disaggregation using Linux io_uring for maximum performance.
+A complete Remote Procedure Call (RPC) implementation demonstrating compute disaggregation using Linux io_uring.
 
 ## Overview
 
 This project implements a high-performance RPC system with:
+
 - **io_uring** for asynchronous I/O operations
 - Binary protocol with efficient serialization
-- Open-loop load testing infrastructure
+- Open-loop load testing
 - Support for four compute operations: hash, sort, matrix multiply, and compression
 
 ## Features
@@ -22,7 +23,7 @@ This project implements a high-performance RPC system with:
 ### Performance Characteristics
 
 - **Zero-copy I/O** where possible using io_uring
-- **Asynchronous request handling** on server
+- **Asynchronous request handling**
 - **Connection pooling** support
 - **Efficient binary protocol** with minimal overhead
 - **Sub-millisecond latencies** for small operations
@@ -59,12 +60,14 @@ All multi-byte integers are in network byte order (big-endian).
 ### Dependencies
 
 Ubuntu/Debian:
+
 ```bash
 sudo apt-get update
 sudo apt-get install -y liburing-dev libssl-dev zlib1g-dev build-essential g++
 ```
 
 Or use the Makefile target:
+
 ```bash
 make deps
 ```
@@ -76,6 +79,7 @@ make all
 ```
 
 This produces:
+
 - `rpc_server`: The RPC server binary
 - `load_test`: Load testing tool
 
@@ -90,6 +94,7 @@ This produces:
 Default port is 8080.
 
 Example:
+
 ```bash
 ./rpc_server 9000
 ```
@@ -101,6 +106,7 @@ Example:
 ```
 
 Example:
+
 ```bash
 ./load_test 127.0.0.1 8080 results.csv
 ```
@@ -140,6 +146,7 @@ client.compress_data(CompressionAlgo::ZLIB, data, size, compressed);
 ### Open-Loop Design
 
 The load generator uses an **open-loop** approach:
+
 - Requests are sent at precise intervals regardless of response times
 - Multiple worker threads maintain target request rate
 - Each worker independently tracks send times
@@ -155,34 +162,12 @@ The load generator uses an **open-loop** approach:
 ### Test Configuration
 
 Default benchmark suite tests these load levels (req/s):
+
 ```
-10, 50, 100, 200, 500, 1000, 2000, 5000
+1000, 2000, 3000, 5000
 ```
 
-Each test runs for 30 seconds with 8 worker threads.
-
-## Performance Analysis
-
-### Expected Performance
-
-On modern hardware (tested on 8-core Intel Xeon):
-
-| Load (req/s) | Avg Latency | P95 Latency | P99 Latency |
-|--------------|-------------|-------------|-------------|
-| 100          | ~0.5 ms     | ~0.8 ms     | ~1.2 ms     |
-| 500          | ~0.8 ms     | ~1.5 ms     | ~2.0 ms     |
-| 1000         | ~1.2 ms     | ~2.5 ms     | ~3.5 ms     |
-| 2000         | ~2.0 ms     | ~5.0 ms     | ~8.0 ms     |
-
-### Key Observations
-
-1. **Linear scaling**: Latency increases linearly with load until saturation
-2. **Knee point**: System typically saturates around 3000-4000 req/s per core
-3. **Operation differences**:
-   - hash_compute: Fastest (~0.3ms base latency)
-   - sort_array: Moderate (~0.8ms for 1000 elements)
-   - matrix_multiply: Heavy (~5ms for 16x16)
-   - compress_data: Variable (depends on data entropy)
+Each test runs for 30 seconds with 4 worker threads.
 
 ### Plotting Results
 
@@ -193,6 +178,7 @@ python3 plot_results.py load_test_results.csv
 ```
 
 This generates:
+
 - Load vs. Latency curves (avg, P95, P99)
 - Throughput saturation analysis
 - Per-operation performance comparison
@@ -204,10 +190,9 @@ This generates:
 **Choice: Binary protocol**
 
 Rationale:
+
 - 3-5x smaller message size
 - Zero parsing overhead
-- Deterministic serialization performance
-- Better cache locality
 
 Trade-off: Less human-readable, harder to debug
 
@@ -218,13 +203,14 @@ All integers use network byte order (big-endian) for cross-platform compatibilit
 ### Fixed-Size Header
 
 24-byte fixed header enables:
+
 - Single read operation for header
 - Zero-copy validation
-- Efficient pipelining
 
 ### Request IDs
 
 64-bit request IDs allow:
+
 - Request/response matching
 - Out-of-order responses
 - Debugging and tracing
@@ -247,6 +233,7 @@ enum class RPCError {
 ### Client Retry Logic
 
 The client library includes:
+
 - Automatic reconnection on connection loss
 - Configurable timeout values
 - Graceful error propagation
@@ -263,7 +250,7 @@ The client library includes:
 ### io_uring Configuration
 
 ```cpp
-constexpr int QUEUE_DEPTH = 256;  // Submission queue depth
+constexpr int QUEUE_DEPTH = 1024;  // Submission queue depth
 ```
 
 - Larger depth = more concurrent operations
@@ -274,7 +261,6 @@ constexpr int QUEUE_DEPTH = 256;  // Submission queue depth
 1. **Zero-copy where possible**: Direct buffer reuse
 2. **Connection pooling**: Reuse connections
 3. **Efficient event handling**: Batch processing completions
-4. **NUMA-aware**: Pin threads to cores
 
 ### Client Optimizations
 
@@ -311,14 +297,6 @@ make test
 ```
 
 This starts the server, runs load tests, and stops the server.
-
-### Stress Testing
-
-Extended high-load testing:
-
-```bash
-./load_test 127.0.0.1 8080 stress_results.csv
-```
 
 ## Limitations and Future Work
 
