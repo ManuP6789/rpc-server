@@ -25,8 +25,6 @@ This project implements a high-performance RPC system with:
 - **Zero-copy I/O** where possible using io_uring
 - **Asynchronous request handling**
 - **Connection pooling** support
-- **Efficient binary protocol** with minimal overhead
-- **Sub-millisecond latencies** for small operations
 
 ## Architecture
 
@@ -133,7 +131,6 @@ client.sort_array(array, 5);
 
 // Matrix multiplication
 double matA[16], matB[16], result[16];
-// ... initialize matrices ...
 client.matrix_multiply(matA, matB, 4, result);
 
 // Compress data
@@ -213,7 +210,6 @@ All integers use network byte order (big-endian) for cross-platform compatibilit
 
 - Request/response matching
 - Out-of-order responses
-- Debugging and tracing
 
 ## Error Handling
 
@@ -256,17 +252,6 @@ constexpr int QUEUE_DEPTH = 1024;  // Submission queue depth
 - Larger depth = more concurrent operations
 - Trade-off: Memory usage vs. throughput
 
-### Server Optimizations
-
-1. **Zero-copy where possible**: Direct buffer reuse
-2. **Connection pooling**: Reuse connections
-3. **Efficient event handling**: Batch processing completions
-
-### Client Optimizations
-
-1. **Connection reuse**: Single persistent connection
-2. **Request pipelining**: Send multiple requests
-3. **Batch operations**: Group small requests
 
 ## Testing
 
@@ -275,28 +260,9 @@ constexpr int QUEUE_DEPTH = 1024;  // Submission queue depth
 Basic functionality tests for each operation:
 
 ```bash
-# Test hash computation
-echo "test data" | ./test_hash
-
-# Test sorting
-./test_sort
-
-# Test matrix multiplication
-./test_matrix
-
-# Test compression
-./test_compress
+# Test rpc operations
+./test_rpc
 ```
-
-### Integration Tests
-
-Full end-to-end testing:
-
-```bash
-make test
-```
-
-This starts the server, runs load tests, and stops the server.
 
 ## Limitations and Future Work
 
@@ -311,29 +277,16 @@ This starts the server, runs load tests, and stops the server.
 ### Future Enhancements
 
 1. **Multi-threaded server**: One io_uring per core
-2. **TLS support**: Encrypted connections
 3. **Load balancing**: Client-side or proxy-based
-4. **Async client API**: Non-blocking operations
+4. **Async client API**: Non-blocking operations (needs work)
 5. **Request batching**: Group small requests
-6. **Compression**: Protocol-level compression
 
 ## References
 
 - [io_uring documentation](https://kernel.dk/io_uring.pdf)
-- [Efficient IO with io_uring](https://kernel.dk/io_uring-whatsnew.pdf)
+- [io_uring man page](https://man7.org/linux/man-pages/man7/io_uring.7.html)
 - [gRPC Design Principles](https://grpc.io/blog/principles/)
-- [Open vs Closed Loop Load Testing](https://www.usenix.org/conference/nsdi21/presentation/brooker)
-
-## License
-
-MIT License - See LICENSE file for details
 
 ## Contributors
 
 Course Assignment Implementation - CS Disaggregated Computing
-
-## Acknowledgments
-
-- Linux io_uring team for the excellent async I/O framework
-- OpenSSL team for SHA-256 implementation
-- zlib team for compression library
